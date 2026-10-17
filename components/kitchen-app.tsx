@@ -12,6 +12,23 @@ import { assertCanConsume, riskScore } from "@/lib/domain";
 
 type View = "home" | "inventory" | "receipt" | "recipes" | "shopping" | "waste" | "settings";
 type ShopItem = { id: string; name: string; amount: string; checked: boolean; source: string };
+type ReceiptResult = {
+  storeName: string | null;
+  purchasedAt: string | null;
+  total: number | null;
+  items: Array<{
+    name: string;
+    normalizedName: string;
+    quantity: number;
+    unit: InventoryLot["unit"];
+    price: number | null;
+    category: "ingredient" | "seasoning" | "daily_goods" | "unknown";
+    confidence: number;
+  }>;
+  warnings: string[];
+  mismatch: boolean;
+  contentHash: string;
+};
 
 const initialLots: InventoryLot[] = [
   { id:"lot-cabbage", name:"キャベツ", category:"野菜", quantity:420, unit:"g", storage:"冷蔵", expiresIn:1, expiryType:"消費期限", opened:true, price:198 },
@@ -129,11 +146,35 @@ function Inventory({lots,setLots,flash}:{lots:InventoryLot[];setLots:(v:Inventor
 }
 
 function Receipt({setLots,flash}:{setLots:React.Dispatch<React.SetStateAction<InventoryLot[]>>;flash:(s:string)=>void}){
-  const input=useRef<HTMLInputElement>(null); const [file,setFile]=useState<File|null>(null); const [parsed,setParsed]=useState(false); const [loading,setLoading]=useState(false);
-  const scan=async()=>{if(!file){flash("画像を選択してください");return}setLoading(true);await new Promise(r=>setTimeout(r,900));setParsed(true);setLoading(false)};
-  const items=[{name:"トマト",qty:3,unit:"個",price:258},{name:"鶏むね肉",qty:320,unit:"g",price:384},{name:"ヨーグルト",qty:1,unit:"個",price:148}];
-  const register=()=>{setLots(prev=>[{id:`lot-${Date.now()}-1`,name:"トマト",category:"野菜",quantity:3,unit:"個",storage:"冷蔵",expiresIn:null,expiryType:"未設定",opened:false,price:258},...prev]);flash("3品を確認済みとして登録しました");setParsed(false);setFile(null)};
-  return <section className="space-y-5"><PageIntro kicker="RECEIPT SCAN" title="買ったものを在庫へ" desc="画像は解析時だけ送信します。期限が読めない場合は、勝手に補完しません。"/><div className="grid gap-5 lg:grid-cols-[.85fr_1.15fr]"><div className="rounded-[24px] border border-[#dedfd8] bg-[#fbfaf6] p-5"><button onClick={()=>input.current?.click()} className="grid min-h-[310px] w-full place-items-center rounded-2xl border-2 border-dashed border-[#b8c7bd] bg-[#edf2ec] p-6 text-center transition hover:bg-[#e7eee6]"><div><span className="mx-auto grid h-16 w-16 place-items-center rounded-full bg-white text-[#28674c] shadow-sm"><Camera size={28}/></span><b className="mt-4 block">レシートを撮影・選択</b><p className="mt-2 text-xs leading-5 text-[#718078]">JPEG / PNG / WebP・最大10MB<br/>ピントが合った画像を使ってください</p>{file&&<span className="mt-4 inline-block rounded-full bg-white px-3 py-1.5 text-xs font-bold">{file.name}</span>}</div></button><input ref={input} type="file" accept="image/jpeg,image/png,image/webp" capture="environment" className="hidden" onChange={e=>setFile(e.target.files?.[0]??null)}/><button onClick={scan} disabled={loading} className="mt-3 w-full rounded-xl bg-[#235f46] py-3 text-sm font-black text-white disabled:opacity-50">{loading?"安全に解析しています…":"Geminiで読み取る"}</button></div><div className="rounded-[24px] border border-[#dedfd8] bg-[#fbfaf6] p-5 sm:p-6"><Title eyebrow="確認してから登録" title="読み取り結果"/>{!parsed?<Empty icon={ReceiptText} title="まだ読み取っていません" text="画像を選ぶと、商品名・数量・金額を確認できます。"/>:<div className="mt-5"><div className="mb-4 flex justify-between rounded-xl bg-[#f0eee7] p-3 text-xs"><span>まいばすけっと（デモ）</span><b>合計 ¥790</b></div><div className="divide-y divide-[#e3e3dc]">{items.map((i,idx)=><div key={i.name} className="grid grid-cols-[1fr_75px_75px] items-center gap-2 py-3"><label className="text-xs text-[#73837c]">商品名<input defaultValue={i.name} className="mt-1 w-full rounded-lg border border-[#daddd5] bg-white px-2 py-2 text-sm font-bold text-[#173a2f]"/></label><label className="text-xs text-[#73837c]">数量<input defaultValue={`${i.qty}${i.unit}`} className="mt-1 w-full rounded-lg border border-[#daddd5] bg-white px-2 py-2 text-sm"/></label><label className="text-xs text-[#73837c]">金額<input defaultValue={`¥${i.price}`} className="mt-1 w-full rounded-lg border border-[#daddd5] bg-white px-2 py-2 text-sm"/></label>{idx===0&&<span className="col-span-3 flex items-center gap-1 text-[10px] font-bold text-[#9a6b33]"><CircleAlert size={12}/>期限は未設定です。登録後に追加できます。</span>}</div>)}</div><button onClick={register} className="mt-5 w-full rounded-xl bg-[#235f46] py-3 text-sm font-black text-white">3品を在庫に登録</button></div>}</div></div></section>
+  const input=useRef<HTMLInputElement>(null); const [file,setFile]=useState<File|null>(null); const [result,setResult]=useState<ReceiptResult|null>(null); const [loading,setLoading]=useState(false); const [error,setError]=useState("");
+  const scan=async()=>{
+    if(!file){flash("画像を選択してください");return}
+    setLoading(true); setError(""); setResult(null);
+    try {
+      const body=new FormData(); body.append("image",file);
+      const response=await fetch("/api/receipts/analyze",{method:"POST",body});
+      const data=await response.json() as ReceiptResult|{error?:string;code?:string};
+      if(!response.ok){
+        const message="code" in data&&data.code==="AI_UNAVAILABLE"?"Gemini APIキーが未設定です。.env.local を確認してください。":"error" in data&&data.error?data.error:"レシートを解析できませんでした";
+        throw new Error(message);
+      }
+      setResult(data as ReceiptResult);
+    } catch(e) { setError(e instanceof Error?e.message:"レシートを解析できませんでした"); }
+    finally { setLoading(false); }
+  };
+  const updateItem=(index:number,patch:Partial<ReceiptResult["items"][number]>)=>setResult(current=>current?{...current,items:current.items.map((item,i)=>i===index?{...item,...patch}:item)}:current);
+  const register=()=>{
+    if(!result)return;
+    const food=result.items.filter(item=>item.category!=="daily_goods");
+    if(!food.length){flash("在庫に登録できる食品がありません");return}
+    const now=Date.now();
+    const lots:InventoryLot[]=food.map((item,index)=>({id:`lot-${now}-${index}`,name:item.normalizedName.trim()||item.name.trim(),category:item.category==="seasoning"?"調味料":item.category==="ingredient"?"食材":"その他",quantity:item.quantity,unit:item.unit,storage:item.category==="seasoning"?"常温":"冷蔵",expiresIn:null,expiryType:"未設定",opened:false,price:item.price??0}));
+    setLots(prev=>[...lots,...prev]);
+    const skipped=result.items.length-food.length;
+    flash(`${lots.length}品を在庫に登録しました${skipped?`（日用品${skipped}品は除外）`:""}`);
+    setResult(null); setFile(null); setError(""); if(input.current)input.current.value="";
+  };
+  return <section className="space-y-5"><PageIntro kicker="RECEIPT SCAN" title="買ったものを在庫へ" desc="画像は解析時だけ送信します。期限が読めない場合は、勝手に補完しません。"/><div className="grid gap-5 lg:grid-cols-[.85fr_1.15fr]"><div className="rounded-[24px] border border-[#dedfd8] bg-[#fbfaf6] p-5"><button onClick={()=>input.current?.click()} className="grid min-h-[310px] w-full place-items-center rounded-2xl border-2 border-dashed border-[#b8c7bd] bg-[#edf2ec] p-6 text-center transition hover:bg-[#e7eee6]"><div><span className="mx-auto grid h-16 w-16 place-items-center rounded-full bg-white text-[#28674c] shadow-sm"><Camera size={28}/></span><b className="mt-4 block">レシートを撮影・選択</b><p className="mt-2 text-xs leading-5 text-[#718078]">JPEG / PNG / WebP・最大10MB<br/>ピントが合った画像を使ってください</p>{file&&<span className="mt-4 inline-block max-w-full truncate rounded-full bg-white px-3 py-1.5 text-xs font-bold">{file.name}</span>}</div></button><input ref={input} type="file" accept="image/jpeg,image/png,image/webp" capture="environment" className="hidden" onChange={e=>{setFile(e.target.files?.[0]??null);setResult(null);setError("")}}/><button onClick={scan} disabled={loading||!file} className="mt-3 w-full rounded-xl bg-[#235f46] py-3 text-sm font-black text-white disabled:opacity-50">{loading?"Geminiで解析しています…":"Geminiで読み取る"}</button>{error&&<p role="alert" className="mt-3 rounded-xl bg-[#fff0e9] p-3 text-xs font-bold leading-5 text-[#a64f3e]">{error}</p>}</div><div className="rounded-[24px] border border-[#dedfd8] bg-[#fbfaf6] p-5 sm:p-6"><Title eyebrow="確認してから登録" title="読み取り結果"/>{!result?<Empty icon={ReceiptText} title={loading?"解析中です":"まだ読み取っていません"} text={loading?"商品名・数量・金額を抽出しています。":"画像を選ぶと、商品名・数量・金額を確認できます。"}/>:<div className="mt-5"><div className="mb-4 flex flex-wrap justify-between gap-2 rounded-xl bg-[#f0eee7] p-3 text-xs"><span>{result.storeName??"店舗名不明"}{result.purchasedAt?` · ${result.purchasedAt}`:""}</span><b>{result.total===null?"合計不明":`合計 ¥${result.total.toLocaleString()}`}</b></div>{(result.mismatch||result.warnings.length>0)&&<div className="mb-3 rounded-xl bg-[#fff6e5] p-3 text-xs leading-5 text-[#896027]">{result.mismatch&&<p className="flex items-center gap-1 font-bold"><CircleAlert size={13}/>明細と合計金額が一致しません。登録前に確認してください。</p>}{result.warnings.map(w=><p key={w}>・{w}</p>)}</div>}<div className="divide-y divide-[#e3e3dc]">{result.items.map((item,idx)=><div key={`${item.name}-${idx}`} className="grid grid-cols-[minmax(0,1fr)_70px_82px] items-end gap-2 py-3"><label className="text-xs text-[#73837c]">商品名<input value={item.normalizedName} onChange={e=>updateItem(idx,{normalizedName:e.target.value})} className="mt-1 w-full rounded-lg border border-[#daddd5] bg-white px-2 py-2 text-sm font-bold text-[#173a2f]"/></label><label className="text-xs text-[#73837c]">数量<input type="number" min="0.01" step="0.01" value={item.quantity} onChange={e=>updateItem(idx,{quantity:Number(e.target.value)})} className="mt-1 w-full rounded-lg border border-[#daddd5] bg-white px-2 py-2 text-sm"/></label><label className="text-xs text-[#73837c]">単位<select value={item.unit} onChange={e=>updateItem(idx,{unit:e.target.value as InventoryLot["unit"]})} className="mt-1 w-full rounded-lg border border-[#daddd5] bg-white px-2 py-2 text-sm">{["g","kg","ml","L","個","本","袋","枚","パック"].map(unit=><option key={unit}>{unit}</option>)}</select></label><label className="col-span-2 text-xs text-[#73837c]">金額<input type="number" min="0" value={item.price??""} placeholder="不明" onChange={e=>updateItem(idx,{price:e.target.value===""?null:Number(e.target.value)})} className="mt-1 w-full rounded-lg border border-[#daddd5] bg-white px-2 py-2 text-sm"/></label><span className={`rounded-full px-2 py-2 text-center text-[10px] font-black ${item.confidence<.7?"bg-[#fff0df] text-[#99612f]":"bg-[#e7f0e9] text-[#47705d]"}`}>{item.category==="daily_goods"?"日用品":`${Math.round(item.confidence*100)}%`}</span>{item.confidence<.7&&<span className="col-span-3 flex items-center gap-1 text-[10px] font-bold text-[#9a6b33]"><CircleAlert size={12}/>読み取り精度が低いため、内容を確認してください。</span>}</div>)}</div><p className="mt-3 text-[10px] font-bold text-[#7a8982]">期限はすべて未設定で登録します。日用品は在庫登録から除外します。</p><button onClick={register} disabled={!result.items.some(item=>item.category!=="daily_goods"&&item.normalizedName.trim()&&item.quantity>0)} className="mt-5 w-full rounded-xl bg-[#235f46] py-3 text-sm font-black text-white disabled:opacity-50">食品 {result.items.filter(item=>item.category!=="daily_goods").length}品を在庫に登録</button></div>}</div></div></section>
 }
 
 function Recipes({setCookId}:{setCookId:(id:string)=>void}){return <section className="space-y-5"><PageIntro kicker="SMART RECIPES" title="在庫を活かす献立" desc="期限・使い切り量・買い足し・調理時間をルールで採点しています。" action={<button className="flex items-center gap-2 rounded-xl bg-[#235f46] px-4 py-2.5 text-sm font-black text-white"><Sparkles size={17}/>AIで新しく生成</button>}/><div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">{recipes.map(r=><div key={r.id}><RecipeCard recipe={r} cook={()=>setCookId(r.id)}/><div className="-mt-2 rounded-b-2xl border border-t-0 border-[#dedfd8] bg-[#edf2ec] px-4 pb-3 pt-4 text-xs"><b>スコアの理由</b><ul className="mt-1 space-y-1 text-[#60766c]"><li>+ 期限が近い食材を優先</li><li>+ {r.use}</li><li>+ {r.missing}</li></ul></div></div>)}</div></section>}
